@@ -60,6 +60,7 @@ def process_batch(detections, labels, iouv):
     correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
     iou = box_iou(labels[:, 1:], detections[:, :4])
     correct_class = labels[:, 0:1] == detections[:, 5]
+    all_ious = []  # To store IoU of all correctly detected boxes
     for i in range(len(iouv)):
         x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
         if x[0].shape[0]:
@@ -70,7 +71,8 @@ def process_batch(detections, labels, iouv):
                 # matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
             correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
+            all_ious.extend(matches[:, 2].tolist())  # Add IoUs for correctly matched detections
+    return torch.tensor(correct, dtype=torch.bool, device=iouv.device), all_ious
 
 
 @smart_inference_mode()
@@ -176,6 +178,7 @@ def run(
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
+    ious = []
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         callbacks.run('on_val_batch_start')
         with dt[0]:
@@ -208,11 +211,17 @@ def run(
 
         # Metrics
         for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
+        labels = targets[targets[:, 0] == si, 1:]
+        if labels.numel():
+            labels[:, 1:] *= torch.tensor((width, height, width, height), device=device)  # scale labels to pixels
+        tcls = labels[:, 0].tolist() if labels.numel() else []  # target class
+        path, shape = Path(paths[si]), shapes[si]
+        if pred is not None and len(pred):
+            # Convert predictions to target format
+            predn = torch.cat((pred[:, :4], torch.sigmoid(pred[:, 4:5]), pred[:, 5:]), 1)
+            predn[:, :4] = scale_coords(im[si].shape[1:], predn[:, :4], shapes[si]).round()
+            correct, batch_ious = process_batch(predn, labels, iouv)
+            ious.extend(batch_ious)
 
             if npr == 0:
                 if nl:
@@ -259,6 +268,9 @@ def run(
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
+    # Calculate mean IoU
+    mean_iou = np.mean(ious) if ious else 0
+    LOGGER.info(f'Mean IoU: {mean_iou:.4f}')
     # Print results
     pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
